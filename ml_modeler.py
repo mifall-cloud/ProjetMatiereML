@@ -27,13 +27,18 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
+    accuracy_score,
     recall_score, 
     precision_score, 
     f1_score,
+    roc_auc_score,
     average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
     confusion_matrix,
-    classification_report
+    precision_recall_curve
 )
 
 # XGBoost
@@ -56,6 +61,11 @@ class Config:
     DATA_DIR = Path(".")  # Répertoire courant par défaut
     TRAIN_FILE = "Data/train_ready.csv"
     TEST_FILE = "Data/test_ready.csv"
+    FALLBACK_DATA_DIRS = [
+        Path("vraipourtraining copy"),
+        Path("data"),
+        Path("Data")
+    ]
     
     # Chemins de sortie
     MODEL_DIR = Path("models")
@@ -76,6 +86,9 @@ class Config:
     
     # Seeds pour reproductibilité
     RANDOM_STATE = 42
+
+    # Validation set interne pour un pipeline expérimental propre
+    VALIDATION_SIZE = 0.2
     
     # Hyperparamètres XGBoost (optimisés pour déséquilibre)
     XGB_PARAMS = {
@@ -146,6 +159,8 @@ class SpaceCollisionModeler:
         # Données
         self.X_train = None
         self.y_train = None
+        self.X_val = None
+        self.y_val = None
         self.X_test = None
         self.y_test = None
         self.feature_names = None
@@ -160,6 +175,8 @@ class SpaceCollisionModeler:
         
         # Statistiques
         self.actual_class_ratio = None
+        self.metrics_history = {}
+        self.selected_thresholds = {}
         
         # Créer les dossiers de sortie
         self.config.MODEL_DIR.mkdir(exist_ok=True)
@@ -177,18 +194,7 @@ class SpaceCollisionModeler:
         print("🔄 Chargement des données...")
         print(f"   📂 Répertoire: {self.config.DATA_DIR.absolute()}")
         
-        # Vérification existence des fichiers
-        if not self.train_path.exists():
-            raise FileNotFoundError(
-                f"❌ Fichier introuvable: {self.train_path}\n"
-                f"   Assurez-vous que {self.config.TRAIN_FILE} est dans {self.config.DATA_DIR}"
-            )
-        
-        if not self.test_path.exists():
-            raise FileNotFoundError(
-                f"❌ Fichier introuvable: {self.test_path}\n"
-                f"   Assurez-vous que {self.config.TEST_FILE} est dans {self.config.DATA_DIR}"
-            )
+        self._resolve_data_paths()
         
         # Lecture des CSV
         print(f"   📥 Lecture de {self.config.TRAIN_FILE}...")
@@ -215,10 +221,18 @@ class SpaceCollisionModeler:
         feature_cols = [col for col in train_df.columns 
                        if col not in self.config.EXCLUDE_COLS]
         
-        self.X_train = train_df[feature_cols].copy()
-        self.y_train = train_df[self.config.TARGET_COL].copy()
+        X_full_train = train_df[feature_cols].copy()
+        y_full_train = train_df[self.config.TARGET_COL].copy()
         self.X_test = test_df[feature_cols].copy()
         self.y_test = test_df[self.config.TARGET_COL].copy()
+
+        self.X_train, self.X_val, self.y_train, self.y_val = train_test_split(
+            X_full_train,
+            y_full_train,
+            test_size=self.config.VALIDATION_SIZE,
+            stratify=y_full_train,
+            random_state=self.config.RANDOM_STATE
+        )
         
         # Stockage des noms de features
         self.feature_names = feature_cols
@@ -228,6 +242,9 @@ class SpaceCollisionModeler:
         
         print(f"\n✅ Données chargées avec succès")
         print(f"   🔢 Nombre de features: {len(feature_cols)}")
+        print(f"   📊 Train (fit): {self.X_train.shape}")
+        print(f"   📊 Validation:  {self.X_val.shape}")
+        print(f"   📊 Test final:  {self.X_test.shape}")
         print(f"\n📊 DISTRIBUTION DES CLASSES (TRAIN):")
         print(f"   Classe 0 (safe):      {(self.y_train == 0).sum():,} ({(self.y_train == 0).mean()*100:.2f}%)")
         print(f"   Classe 1 (collision): {(self.y_train == 1).sum():,} ({(self.y_train == 1).mean()*100:.2f}%)")
@@ -240,6 +257,32 @@ class SpaceCollisionModeler:
             print(f"\n⚠️  ATTENTION: Le ratio configuré ({self.config.CLASS_IMBALANCE_RATIO}) "
                   f"diffère significativement du ratio réel ({self.actual_class_ratio:.0f})")
             print(f"   💡 Conseil: Utiliser le ratio réel pour scale_pos_weight")
+
+    def _resolve_data_paths(self):
+        """Résout automatiquement les chemins des données."""
+        candidates = [(self.train_path, self.test_path)]
+
+        for directory in self.config.FALLBACK_DATA_DIRS:
+            candidates.append((
+                directory / Path(self.config.TRAIN_FILE).name,
+                directory / Path(self.config.TEST_FILE).name
+            ))
+
+        for train_candidate, test_candidate in candidates:
+            if train_candidate.exists() and test_candidate.exists():
+                self.train_path = train_candidate
+                self.test_path = test_candidate
+                print(f"   ✅ Données trouvées dans: {train_candidate.parent}")
+                return
+
+        tried_paths = "\n".join(
+            f"   - {train_candidate} | {test_candidate}"
+            for train_candidate, test_candidate in candidates
+        )
+        raise FileNotFoundError(
+            "❌ Impossible de localiser les fichiers train/test.\n"
+            f"   Emplacements testés:\n{tried_paths}"
+        )
     
     def _optimize_dtypes(self, df):
         """Optimisation mémoire des types de données"""
@@ -354,6 +397,8 @@ class SpaceCollisionModeler:
         # Évaluation
         self._evaluate_model(
             model=self.baseline_model,
+            X_val=self.X_val,
+            y_val=self.y_val,
             X_test=self.X_test,
             y_test=self.y_test,
             model_name="Baseline (LR)"
@@ -382,11 +427,12 @@ class SpaceCollisionModeler:
         print("\n" + "="*80)
         print("🚀 MODÈLE 2/3 : CHAMPION (XGBoost)")
         print("="*80)
-        print(f"📋 Stratégie: scale_pos_weight={self.config.CLASS_IMBALANCE_RATIO}")
+        print(f"📋 Stratégie: scale_pos_weight=ratio réel ({self.actual_class_ratio:.2f})")
         
         # Preprocessing manuel (XGB n'accepte que des arrays)
         print("⏳ Preprocessing des données...")
         X_train_prep = self.preprocessor.fit_transform(self.X_train)
+        X_val_prep = self.preprocessor.transform(self.X_val)
         X_test_prep = self.preprocessor.transform(self.X_test)
         
         # Configuration des paramètres
@@ -395,7 +441,7 @@ class SpaceCollisionModeler:
         # 🎯 PARAMÈTRE CRITIQUE: scale_pos_weight
         # On peut utiliser soit la valeur configurée, soit le ratio réel
         # Ici on prend le ratio configuré (226) comme demandé dans le prompt
-        params['scale_pos_weight'] = self.config.CLASS_IMBALANCE_RATIO
+        params['scale_pos_weight'] = self.actual_class_ratio
         
         print(f"   🎯 scale_pos_weight = {params['scale_pos_weight']}")
         print(f"   🎯 learning_rate = {params['learning_rate']}")
@@ -407,13 +453,15 @@ class SpaceCollisionModeler:
         self.champion_model.fit(
             X_train_prep,
             self.y_train,
-            eval_set=[(X_test_prep, self.y_test)],
+            eval_set=[(X_val_prep, self.y_val)],
             verbose=False
         )
         
         # Évaluation
         self._evaluate_model_preprocessed(
             model=self.champion_model,
+            X_val_prep=X_val_prep,
+            y_val=self.y_val,
             X_test_prep=X_test_prep,
             y_test=self.y_test,
             model_name="Champion (XGB)"
@@ -425,6 +473,7 @@ class SpaceCollisionModeler:
         print(f"✅ Modèle sauvegardé: {model_path}")
         
         # Stockage pour export final
+        self._X_val_prep_xgb = X_val_prep
         self._X_test_prep_xgb = X_test_prep
     
     # ═══════════════════════════════════════════════════════════════════════
@@ -457,7 +506,10 @@ class SpaceCollisionModeler:
         # ImbPipeline garantit que SMOTE n'est appliqué que sur fit(), pas sur predict()
         self.deep_model = ImbPipeline([
             ('preprocessor', self.preprocessor),
-           
+            ('smote', SMOTE(
+                sampling_strategy=self.config.SMOTE_SAMPLING_STRATEGY,
+                random_state=self.config.RANDOM_STATE
+            )),
             ('classifier', MLPClassifier(**self.config.MLP_PARAMS))
         ])
         
@@ -489,6 +541,8 @@ class SpaceCollisionModeler:
         # Évaluation
         self._evaluate_model(
             model=self.deep_model,
+            X_val=self.X_val,
+            y_val=self.y_val,
             X_test=self.X_test,
             y_test=self.y_test,
             model_name="Deep (MLP+SMOTE)"
@@ -503,46 +557,84 @@ class SpaceCollisionModeler:
     # UTILITAIRES D'ÉVALUATION
     # ═══════════════════════════════════════════════════════════════════════
     
-    def _evaluate_model(self, model, X_test, y_test, model_name):
-        """Évalue un modèle avec pipeline complet"""
-        y_pred = model.predict(X_test)
-        y_proba = model.predict_proba(X_test)[:, 1]
-        
-        self._print_metrics(y_test, y_pred, y_proba, model_name)
+    def _evaluate_model(self, model, X_val, y_val, X_test, y_test, model_name):
+        """Évalue un modèle avec pipeline complet."""
+        y_val_proba = model.predict_proba(X_val)[:, 1]
+        threshold = self._find_best_threshold(y_val, y_val_proba)
+        y_test_proba = model.predict_proba(X_test)[:, 1]
+        self._print_metrics(y_test, y_test_proba, model_name, threshold)
     
-    def _evaluate_model_preprocessed(self, model, X_test_prep, y_test, model_name):
-        """Évalue un modèle sur des données déjà préprocessées"""
-        y_pred = model.predict(X_test_prep)
-        y_proba = model.predict_proba(X_test_prep)[:, 1]
-        
-        self._print_metrics(y_test, y_pred, y_proba, model_name)
-    
-    def _print_metrics(self, y_true, y_pred, y_proba, model_name):
-        """Affiche les métriques de performance"""
-        recall = recall_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred)
-        auprc = average_precision_score(y_true, y_proba)
-        
-        # Matrice de confusion
-        cm = confusion_matrix(y_true, y_pred)
-        tn, fp, fn, tp = cm.ravel()
-        
+    def _evaluate_model_preprocessed(self, model, X_val_prep, y_val, X_test_prep, y_test, model_name):
+        """Évalue un modèle sur des données déjà préprocessées."""
+        y_val_proba = model.predict_proba(X_val_prep)[:, 1]
+        threshold = self._find_best_threshold(y_val, y_val_proba)
+        y_test_proba = model.predict_proba(X_test_prep)[:, 1]
+        self._print_metrics(y_test, y_test_proba, model_name, threshold)
+
+    def _find_best_threshold(self, y_true, y_proba):
+        """Choisit le seuil maximisant le F1 sur le jeu de validation."""
+        precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
+        if len(thresholds) == 0:
+            return 0.5
+
+        f1_scores = (2 * precision[:-1] * recall[:-1]) / np.clip(
+            precision[:-1] + recall[:-1],
+            1e-12,
+            None
+        )
+        best_idx = int(np.nanargmax(f1_scores))
+        return float(thresholds[best_idx])
+
+    def _compute_metrics(self, y_true, y_proba, threshold):
+        """Calcule un ensemble large de métriques."""
+        y_pred = (y_proba >= threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+        return {
+            'threshold': threshold,
+            'accuracy': accuracy_score(y_true, y_pred),
+            'precision': precision_score(y_true, y_pred, zero_division=0),
+            'recall': recall_score(y_true, y_pred, zero_division=0),
+            'f1': f1_score(y_true, y_pred, zero_division=0),
+            'roc_auc': roc_auc_score(y_true, y_proba),
+            'auprc': average_precision_score(y_true, y_proba),
+            'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+            'specificity': specificity,
+            'brier_score': brier_score_loss(y_true, y_proba),
+            'tn': tn,
+            'fp': fp,
+            'fn': fn,
+            'tp': tp,
+        }
+
+    def _print_metrics(self, y_true, y_proba, model_name, threshold):
+        """Affiche et mémorise les métriques de performance."""
+        metrics = self._compute_metrics(y_true, y_proba, threshold)
+        self.metrics_history[model_name] = metrics
+        self.selected_thresholds[model_name] = threshold
+
         print(f"\n📈 MÉTRIQUES - {model_name}")
         print("-" * 80)
-        print(f"   Recall (Sensibilité):    {recall:.4f}  👈 % de collisions détectées")
-        print(f"   Precision:               {precision:.4f}  👈 % d'alertes vraies")
-        print(f"   F1-Score:                {f1:.4f}")
-        print(f"   AUPRC:                   {auprc:.4f}  👈 Métrique clé (déséquilibre)")
+        print(f"   Seuil optimisé (validation): {metrics['threshold']:.4f}")
+        print(f"   Accuracy:                   {metrics['accuracy']:.4f}")
+        print(f"   Balanced Accuracy:          {metrics['balanced_accuracy']:.4f}")
+        print(f"   Recall (Sensibilité):       {metrics['recall']:.4f}  👈 % de collisions détectées")
+        print(f"   Specificity:                {metrics['specificity']:.4f}")
+        print(f"   Precision:                  {metrics['precision']:.4f}  👈 % d'alertes vraies")
+        print(f"   F1-Score:                   {metrics['f1']:.4f}")
+        print(f"   ROC-AUC:                    {metrics['roc_auc']:.4f}")
+        print(f"   AUPRC:                      {metrics['auprc']:.4f}  👈 Métrique clé (déséquilibre)")
+        print(f"   Brier Score:                {metrics['brier_score']:.6f}")
         print(f"\n🎯 MATRICE DE CONFUSION:")
-        print(f"   TN (Vrai Négatif):  {tn:,}  | FP (Faux Positif):  {fp:,}")
-        print(f"   FN (Faux Négatif):  {fn:,}  | TP (Vrai Positif):  {tp:,}")
-        
-        # Interprétation métier
-        if fn > 0:
-            print(f"\n⚠️  {fn} collision(s) MANQUÉE(S) (Faux Négatifs)")
-        if tp > 0:
-            print(f"✅ {tp} collision(s) DÉTECTÉE(S) (Vrais Positifs)")
+        print(f"   TN (Vrai Négatif):  {metrics['tn']:,}  | FP (Faux Positif):  {metrics['fp']:,}")
+        print(f"   FN (Faux Négatif):  {metrics['fn']:,}  | TP (Vrais Positifs): {metrics['tp']:,}")
+
+        if metrics['fn'] > 0:
+            print(f"\n⚠️  {metrics['fn']} collision(s) MANQUÉE(S) (Faux Négatifs)")
+        if metrics['tp'] > 0:
+            print(f"✅ {metrics['tp']} collision(s) DÉTECTÉE(S) (Vrais Positifs)")
     
     # ═══════════════════════════════════════════════════════════════════════
     # ÉTAPE 6 : FEATURE IMPORTANCE (XGBoost uniquement)
@@ -705,8 +797,9 @@ Ce fichier contient tout ce dont tu as besoin pour faire les graphiques:
    
 3. MATRICE DE CONFUSION:
    from sklearn.metrics import confusion_matrix
-   # Choisir un seuil (ex: 0.5)
-   y_pred = (df['y_proba_xgb'] > 0.5).astype(int)
+   # Utiliser de préférence le seuil optimisé sur validation
+   seuil = self.selected_thresholds.get('Champion (XGB)', 0.5)
+   y_pred = (df['y_proba_xgb'] >= seuil).astype(int)
    cm = confusion_matrix(df['y_true'], y_pred)
    
 4. COMPARAISON DES 3 MODÈLES:
@@ -724,10 +817,6 @@ Ce fichier contient tout ce dont tu as besoin pour faire les graphiques:
         print("="*80)
         
         # Évaluations finales
-        y_pred_lr = self.baseline_model.predict(self.X_test)
-        y_pred_xgb = self.champion_model.predict(self._X_test_prep_xgb)
-        y_pred_mlp = self.deep_model.predict(self.X_test)
-        
         report_lines = []
         report_lines.append("=" * 80)
         report_lines.append("PROJET: PRÉDICTION DE COLLISIONS SPATIALES")
@@ -739,6 +828,7 @@ Ce fichier contient tout ce dont tu as besoin pour faire les graphiques:
         report_lines.append("1. DONNÉES")
         report_lines.append("-" * 80)
         report_lines.append(f"Train size:        {len(self.y_train):,}")
+        report_lines.append(f"Validation size:   {len(self.y_val):,}")
         report_lines.append(f"Test size:         {len(self.y_test):,}")
         report_lines.append(f"Features:          {len(self.feature_names)}")
         report_lines.append(f"Déséquilibre:      {self.actual_class_ratio:.2f} (classe 0 / classe 1)")
@@ -748,30 +838,29 @@ Ce fichier contient tout ce dont tu as besoin pour faire les graphiques:
         report_lines.append("2. STRATÉGIES DE GESTION DU DÉSÉQUILIBRE")
         report_lines.append("-" * 80)
         report_lines.append(f"Baseline (LR):     class_weight='balanced'")
-        report_lines.append(f"Champion (XGB):    scale_pos_weight={self.config.CLASS_IMBALANCE_RATIO}")
+        report_lines.append(f"Champion (XGB):    scale_pos_weight=ratio réel ({self.actual_class_ratio:.2f})")
         report_lines.append(f"Deep (MLP):        SMOTE (sampling_strategy={self.config.SMOTE_SAMPLING_STRATEGY})")
         report_lines.append("")
         
         report_lines.append("3. RÉSULTATS COMPARATIFS (TEST SET)")
         report_lines.append("-" * 80)
         
-        models = [
-            ("Baseline (LR)", y_pred_lr, self.baseline_model.predict_proba(self.X_test)[:, 1]),
-            ("Champion (XGB)", y_pred_xgb, self.champion_model.predict_proba(self._X_test_prep_xgb)[:, 1]),
-            ("Deep (MLP)", y_pred_mlp, self.deep_model.predict_proba(self.X_test)[:, 1])
-        ]
-        
-        for model_name, y_pred, y_proba in models:
-            recall = recall_score(self.y_test, y_pred)
-            precision = precision_score(self.y_test, y_pred)
-            f1 = f1_score(self.y_test, y_pred)
-            auprc = average_precision_score(self.y_test, y_proba)
-            
+        for model_name, metrics in self.metrics_history.items():
             report_lines.append(f"\n{model_name}:")
-            report_lines.append(f"   Recall:    {recall:.4f}")
-            report_lines.append(f"   Precision: {precision:.4f}")
-            report_lines.append(f"   F1-Score:  {f1:.4f}")
-            report_lines.append(f"   AUPRC:     {auprc:.4f}")
+            report_lines.append(f"   Seuil:            {metrics['threshold']:.4f}")
+            report_lines.append(f"   Accuracy:         {metrics['accuracy']:.4f}")
+            report_lines.append(f"   Balanced Acc.:    {metrics['balanced_accuracy']:.4f}")
+            report_lines.append(f"   Recall:           {metrics['recall']:.4f}")
+            report_lines.append(f"   Specificity:      {metrics['specificity']:.4f}")
+            report_lines.append(f"   Precision:        {metrics['precision']:.4f}")
+            report_lines.append(f"   F1-Score:         {metrics['f1']:.4f}")
+            report_lines.append(f"   ROC-AUC:          {metrics['roc_auc']:.4f}")
+            report_lines.append(f"   AUPRC:            {metrics['auprc']:.4f}")
+            report_lines.append(f"   Brier Score:      {metrics['brier_score']:.6f}")
+            report_lines.append(
+                f"   Confusion Matrix: TN={metrics['tn']:,}, FP={metrics['fp']:,}, "
+                f"FN={metrics['fn']:,}, TP={metrics['tp']:,}"
+            )
         
         report_lines.append("")
         report_lines.append("4. FICHIERS GÉNÉRÉS")

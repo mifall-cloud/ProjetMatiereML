@@ -1,6 +1,7 @@
 venv/
 Data/*.csv
 Data/*.parquet
+vraipourtraining copy/*.csv
 models/*.joblib
 __pycache__/
 *.pyc
