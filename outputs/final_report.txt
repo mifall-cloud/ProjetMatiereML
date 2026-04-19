@@ -1,0 +1,63 @@
+================================================================================
+PROJET: PRÉDICTION DE COLLISIONS SPATIALES
+================================================================================
+Date: 2026-04-19 12:38:36
+Dataset: Data/train_ready.csv / Data/test_ready.csv
+
+1. DONNÉES
+--------------------------------------------------------------------------------
+Train size:        162,634
+Test size:         24,484
+Features:          99
+Déséquilibre:      226.14 (classe 0 / classe 1)
+% Collisions:      0.44%
+
+2. STRATÉGIES DE GESTION DU DÉSÉQUILIBRE
+--------------------------------------------------------------------------------
+Baseline (LR):     class_weight='balanced'
+Champion (XGB):    scale_pos_weight=226
+Deep (MLP):        SMOTE (sampling_strategy=0.1)
+
+3. RÉSULTATS COMPARATIFS (TEST SET)
+--------------------------------------------------------------------------------
+
+Baseline (LR):
+   Recall:    1.0000
+   Precision: 0.1703
+   F1-Score:  0.2911
+   AUPRC:     0.6589
+
+Champion (XGB):
+   Recall:    0.9914
+   Precision: 0.7993
+   F1-Score:  0.8851
+   AUPRC:     0.9837
+
+Deep (MLP):
+   Recall:    0.5365
+   Precision: 0.6443
+   F1-Score:  0.5855
+   AUPRC:     0.6120
+
+4. FICHIERS GÉNÉRÉS
+--------------------------------------------------------------------------------
+MODÈLES:
+   • models/baseline_lr.joblib
+   • models/champion_xgb.joblib
+   • models/deep_mlp_smote.joblib
+
+ANALYSES:
+   • outputs/predictions_for_evaluator.csv
+   • outputs/feature_importance.csv
+   • outputs/final_report.txt
+
+5. RECOMMANDATIONS
+--------------------------------------------------------------------------------
+Pour la présentation à Mme Diop:
+   1. Expliquer le défi du déséquilibre (99.5% / 0.5%)
+   2. Justifier les 3 stratégies différentes
+   3. Montrer la feature importance (facteurs physiques)
+   4. Comparer les courbes PR-AUC (via Siny)
+   5. Analyser le compromis Recall/Precision
+
+================================================================================
